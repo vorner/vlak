@@ -2,6 +2,8 @@
 name = "vlak"
 version = "0.1.0"
 authors = ["Michal 'vorner' Vaner <vorner@vorner.cz>"]
+license = "GPL-3.0+"
+readme = "README.md"
 
 [dependencies]
 env_logger = "~0.4"
