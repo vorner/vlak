@@ -1,8 +1,10 @@
-#![feature(conservative_impl_trait)]
+#![feature(clippy, never_type, conservative_impl_trait, generators, plugin, proc_macro)]
+#![recursion_limit = "256"]
+
 extern crate env_logger;
 #[macro_use]
 extern crate error_chain;
-extern crate futures;
+extern crate futures_await as futures;
 extern crate hyper;
 extern crate hyper_tls;
 #[macro_use]
@@ -14,14 +16,18 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate serde_urlencoded;
+extern crate websocket;
 
+use std::cell::RefCell;
 use std::env;
 use std::fmt::Debug;
 use std::io::Error as IoError;
 use std::process;
+use std::rc::Rc;
 
 use futures::{Future, IntoFuture, Stream};
 use futures::future::Either;
+use futures::prelude::*;
 use hyper::{Client, Method, Request, StatusCode, Uri};
 use hyper::client::Connect;
 use hyper::header::{ContentLength, ContentType};
@@ -29,11 +35,13 @@ use hyper::error::{Error as HyperError, UriError};
 use hyper_tls::HttpsConnector;
 use log::SetLoggerError;
 use native_tls::Error as NativeTlsError;
-use tokio_core::reactor::Core;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Error as JsonError, Value};
 use serde_urlencoded::ser::Error as UrlSerError;
+use tokio_core::reactor::{Core, Handle};
+use websocket::client::{ClientBuilder, ParseError};
+use websocket::{OwnedMessage, WebSocketError};
 
 error_chain! {
     foreign_links {
@@ -43,6 +51,8 @@ error_chain! {
         NativeTls(NativeTlsError);
         Log(SetLoggerError);
         Uri(UriError);
+        WSUriError(ParseError);
+        WSError(WebSocketError);
         UrlSerError(UrlSerError);
     }
 
@@ -133,7 +143,7 @@ where
         })
 }
 
-const CONNECT_URI: &str = "https://slack.com/api/rtm.connect";
+const CONNECT_URI: &str = "https://slack.com/api/rtm.start";
 
 #[derive(Debug, Serialize)]
 struct SimpleAuth {
@@ -161,32 +171,136 @@ struct WsAddr {
     url: String,
 }
 
-fn run() -> Result<()> {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Presence {
+    Active,
+    Away,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Notification {
+    PresenceChange {
+        presence: Presence,
+        user: String,
+    },
+    Message {
+        channel: String,
+        user: String,
+        text: String,
+        ts: f64,
+    },
+    ReconnectUrl {
+        url: String,
+    },
+    Hello,
+}
+
+struct CacheInner {
+    client: Client<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>,
+    connect_uri: Option<String>,
+}
+
+#[derive(Clone)]
+struct Cache(Rc<RefCell<CacheInner>>);
+
+impl Cache {
+    fn new(handle: Handle) -> Result<Self> {
+        let client = Client::configure()
+            .connector(HttpsConnector::new(2, &handle)?)
+            .build(&handle);
+        let inner = CacheInner {
+            client,
+            connect_uri: None,
+        };
+        Ok(Cache(Rc::new(RefCell::new(inner))))
+    }
+
+    #[async]
+    fn connect_uri(self) -> Result<String> {
+        let ws_uri = {
+            let me = self.0.borrow();
+            if let Some(ref uri) = me.connect_uri {
+                return Ok(uri.clone());
+            }
+            info!("Requesting address");
+            let token = env::args()
+                .nth(1)
+                .ok_or(ErrorKind::MissingToken)?;
+            let auth = SimpleAuth {
+                token
+            };
+            request(&me.client, CONNECT_URI.parse()?, &auth)
+        };
+        let ws_uri: WsAddr = await!(ws_uri)?;
+        let result = ws_uri.url.clone();
+        self.0.borrow_mut().connect_uri = Some(ws_uri.url);
+        Ok(result)
+    }
+
+    fn update_connect_url(&self, url: String) {
+        self.0.borrow_mut().connect_uri = Some(url);
+    }
+
+    fn invalidate(&self) {
+        // Nothing to invalidate yet. But some info may become stale on reconnect, so wipe it then.
+    }
+}
+
+#[async]
+fn connection(handle: Handle, cache: Cache) -> Result<()> {
+    cache.invalidate();
+    let uri = await!(cache.clone().connect_uri())?;
+    debug!("Connecting to {}", uri);
+    let connection = ClientBuilder::new(&uri)?
+        .async_connect_secure(None, &handle);
+    let (connection, _headers) = await!(connection)?;
+    let (sink, stream) = connection.split();
+    let process = stream
+        .filter_map(move |msg| {
+            trace!("Unparsed: {:?}", msg);
+            match msg {
+                OwnedMessage::Ping(data) => Some(OwnedMessage::Pong(data)),
+                OwnedMessage::Text(text) => {
+                    match serde_json::from_str::<Notification>(&text) {
+                        Ok(Notification::ReconnectUrl { url }) => {
+                            debug!("Updating connect url to {}", url);
+                            cache.update_connect_url(url);
+                        },
+                        Ok(notif) => info!("Notification {:?}", notif),
+                        Err(_) => warn!("Unknown msg '{}'", text),
+                    }
+                    None
+                },
+                _ => {
+                    warn!("Unknown msg {:?}", msg);
+                    None
+                },
+            }
+        })
+        .forward(sink)
+        .map(|_| ());
+    Ok(await!(process)?)
+}
+
+#[async]
+fn keep_running(handle: Handle) -> Result<!> {
+    let cache = Cache::new(handle.clone())?;
+    loop {
+        await!(connection(handle.clone(), cache.clone()))?;
+    }
+}
+
+fn core_loop() -> Result<!> {
     env_logger::init()?;
-    let token = env::args()
-        .nth(1)
-        .ok_or(ErrorKind::MissingToken)?;
-    info!("Starting up");
     let mut core = Core::new()?;
     let handle = core.handle();
-    let client = Client::configure()
-        .connector(HttpsConnector::new(2, &handle)?)
-        .build(&handle);
-    let auth = SimpleAuth {
-        token
-    };
-    let ws_uri = request(&client, CONNECT_URI.parse()?, &auth);
-    let ws_uri: WsAddr = core.run(ws_uri)?;
-    println!("{:?}", ws_uri);
-    Ok(())
+    core.run(keep_running(handle))
 }
 
 fn main() {
-    match run() {
-        Ok(()) => (),
-        Err(e) => {
-            eprintln!("{}", e);
-            process::exit(1);
-        }
-    }
+    let Err(e) = core_loop();
+    eprintln!("{}", e);
+    process::exit(1);
 }
