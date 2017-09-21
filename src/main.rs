@@ -73,8 +73,15 @@ error_chain! {
             description("Unknown response format")
             display("Unknown response format: {}", value)
         }
+        BadAttempts {
+            description("Too many failed connection attempts")
+            display("Too many failed connection attempts")
+        }
     }
 }
+
+const CONNECT_URI: &str = "https://slack.com/api/rtm.start";
+const MAX_ATTEPMS: usize = 3;
 
 fn request_build<Req: Serialize + Debug>(uri: Uri, req: &Req) -> Result<Request> {
     trace!("Building request {:?}/{:?}", uri, req);
@@ -135,15 +142,17 @@ where
                     trace!("Parsed response {:?}", response);
                     match response {
                         MaybeResponse::Correct(resp) => Ok(resp),
-                        MaybeResponse::Error { error } => Err(Error::from(ErrorKind::SlackError(error))),
-                        MaybeResponse::Broken(value) => Err(Error::from(ErrorKind::UnknownFormat(value))),
+                        MaybeResponse::Error { error } => {
+                            Err(Error::from(ErrorKind::SlackError(error)))
+                        },
+                        MaybeResponse::Broken(value) => {
+                            Err(Error::from(ErrorKind::UnknownFormat(value)))
+                        },
                     }
                 });
             Either::B(result)
         })
 }
-
-const CONNECT_URI: &str = "https://slack.com/api/rtm.start";
 
 #[derive(Debug, Serialize)]
 struct SimpleAuth {
@@ -151,23 +160,7 @@ struct SimpleAuth {
 }
 
 #[derive(Debug, Deserialize)]
-struct Team {
-    domain: String,
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct User {
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct WsAddr {
-    #[serde(rename = "self")]
-    me: User,
-    team: Team,
     url: String,
 }
 
@@ -195,11 +188,50 @@ enum Notification {
         url: String,
     },
     Hello,
+    Error {
+        code: i64,
+        msg: String,
+    },
+}
+
+impl Notification {
+    #[async]
+    fn into_action(self) -> Result<Option<Event>> {
+        match self {
+            _ => (),
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UserInfoReq {
+    token: String,
+    user: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct User {
+
+}
+
+struct Channel {
+
+}
+
+enum Event {
+    UserChange(User),
+    Message {
+        user: User,
+        channel: Channel,
+        text: String,
+    }
 }
 
 struct CacheInner {
     client: Client<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>,
     connect_uri: Option<String>,
+    bad_attempts: usize,
 }
 
 #[derive(Clone)]
@@ -213,6 +245,7 @@ impl Cache {
         let inner = CacheInner {
             client,
             connect_uri: None,
+            bad_attempts: 0,
         };
         Ok(Cache(Rc::new(RefCell::new(inner))))
     }
@@ -240,7 +273,20 @@ impl Cache {
     }
 
     fn update_connect_url(&self, url: String) {
-        self.0.borrow_mut().connect_uri = Some(url);
+        let mut borrow = self.0.borrow_mut();
+        borrow.connect_uri = Some(url);
+        borrow.bad_attempts = 0;
+    }
+
+    fn bad_url(&self) -> Result<()> {
+        let mut borrow = self.0.borrow_mut();
+        borrow.connect_uri = None;
+        borrow.bad_attempts += 1;
+        if borrow.bad_attempts > MAX_ATTEPMS {
+            Err(ErrorKind::BadAttempts.into())
+        } else {
+            Ok(())
+        }
     }
 
     fn invalidate(&self) {
@@ -255,33 +301,38 @@ fn connection(handle: Handle, cache: Cache) -> Result<()> {
     debug!("Connecting to {}", uri);
     let connection = ClientBuilder::new(&uri)?
         .async_connect_secure(None, &handle);
-    let (connection, _headers) = await!(connection)?;
+    let connection = match await!(connection) {
+        Ok((connection, _headers)) => connection,
+        Err(e) => {
+            error!("Connection error: {}", e);
+            return cache.bad_url();
+        }
+    };
     let (sink, stream) = connection.split();
-    let process = stream
-        .filter_map(move |msg| {
-            trace!("Unparsed: {:?}", msg);
-            match msg {
-                OwnedMessage::Ping(data) => Some(OwnedMessage::Pong(data)),
-                OwnedMessage::Text(text) => {
-                    match serde_json::from_str::<Notification>(&text) {
-                        Ok(Notification::ReconnectUrl { url }) => {
-                            debug!("Updating connect url to {}", url);
-                            cache.update_connect_url(url);
-                        },
-                        Ok(notif) => info!("Notification {:?}", notif),
-                        Err(_) => warn!("Unknown msg '{}'", text),
-                    }
-                    None
+    let mut sink = sink;
+    #[async]
+    for msg in stream {
+        trace!("Unparsed: {:?}", msg);
+        match msg {
+            OwnedMessage::Ping(data) => {
+                sink = await!(sink.send(OwnedMessage::Pong(data)))?;
+            },
+            OwnedMessage::Text(text) => match serde_json::from_str::<Notification>(&text) {
+                Ok(Notification::ReconnectUrl { url }) => {
+                    debug!("Updating connect url to {}", url);
+                    cache.update_connect_url(url);
                 },
-                _ => {
-                    warn!("Unknown msg {:?}", msg);
-                    None
+                Ok(Notification::Error { msg,.. }) => {
+                    error!("Error from slack: {}", msg);
+                    return cache.bad_url();
                 },
-            }
-        })
-        .forward(sink)
-        .map(|_| ());
-    Ok(await!(process)?)
+                Ok(notif) => info!("Notification {:?}", notif),
+                Err(_) => warn!("Unknown msg '{}'", text),
+            },
+            _ => warn!("Unknown msg {:?}", msg),
+        }
+    }
+    Ok(())
 }
 
 #[async]
