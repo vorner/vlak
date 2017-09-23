@@ -19,8 +19,9 @@ extern crate serde_urlencoded;
 extern crate websocket;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::io::Error as IoError;
 use std::process;
 use std::rc::Rc;
@@ -81,6 +82,8 @@ error_chain! {
 }
 
 const CONNECT_URI: &str = "https://slack.com/api/rtm.start";
+const USER_INFO_REQ:  &str = "https://slack.com/api/users.info";
+const CHANNEL_INFO_REQ: &str = "https://slack.com/api/conversations.info";
 const MAX_ATTEPMS: usize = 3;
 
 fn request_build<Req: Serialize + Debug>(uri: Uri, req: &Req) -> Result<Request> {
@@ -182,12 +185,13 @@ enum Notification {
         channel: String,
         user: String,
         text: String,
-        ts: f64,
+        ts: String, // WTF? Why is it string if it can be float?
     },
     ReconnectUrl {
         url: String,
     },
     Hello,
+    // UserChanged, ChannelChanged
     Error {
         code: i64,
         msg: String,
@@ -196,30 +200,61 @@ enum Notification {
 
 impl Notification {
     #[async]
-    fn into_action(self) -> Result<Option<Event>> {
-        match self {
-            _ => (),
-        }
-        Ok(None)
+    fn into_event(self, cache: Cache) -> Result<Option<Event>> {
+        let result = match self {
+            Notification::PresenceChange { presence, user } => {
+                let user = await!(cache.user(user))?;
+                Some(Event::PresenceChange { presence, user })
+            },
+            Notification::Message { channel, user, text, .. } => {
+                // TODO: The time stamp?
+                let user = cache.clone().user(user);
+                let channel = cache.channel(channel);
+                let (user, channel) = await!(user.join(channel))?;
+                Some(Event::Message{ user, channel, text })
+            }
+            _ => None,
+        };
+        Ok(result)
     }
 }
 
-#[derive(Debug, Serialize)]
-struct UserInfoReq {
-    token: String,
-    user: String,
+#[derive(Clone, Debug, Deserialize)]
+struct Profile {
+    #[serde(default)]
+    status_text: String,
+    real_name_normalized: String,
+    real_name: String,
+    display_name_normalized: String,
+    display_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct User {
+    id: String,
+    team_id: String,
+    profile: Profile,
+    name: String,
+    real_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Channel {
+    id: String,
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct User {
-
+struct ChannelWrapper {
+    channel: Channel,
 }
 
-struct Channel {
-
-}
-
+#[derive(Debug)]
 enum Event {
+    PresenceChange {
+        user: User,
+        presence: Presence,
+    },
     UserChange(User),
     Message {
         user: User,
@@ -228,10 +263,40 @@ enum Event {
     }
 }
 
+impl Display for Event {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match *self {
+            Event::PresenceChange { ref user, ref presence } => {
+                write!(f,
+                       "@{} [{}] is now {:?}",
+                       user.profile.display_name,
+                       user.profile.real_name,
+                       presence)
+            },
+            Event::Message { ref user, ref channel, ref text } => {
+                let chname = channel.name
+                    .as_ref()
+                    .map(|name| format!("#{}\t", name))
+                    .unwrap_or_else(String::new);
+                write!(f,
+                       "{}@{} [{}]: {}",
+                       chname,
+                       user.profile.display_name,
+                       user.profile.real_name,
+                       text)
+            }
+            _ => (self as &Debug).fmt(f)
+        }
+    }
+}
+
 struct CacheInner {
     client: Client<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>,
     connect_uri: Option<String>,
     bad_attempts: usize,
+    token: String,
+    users: HashMap<String, User>,
+    channels: HashMap<String, Channel>,
 }
 
 #[derive(Clone)]
@@ -239,6 +304,9 @@ struct Cache(Rc<RefCell<CacheInner>>);
 
 impl Cache {
     fn new(handle: Handle) -> Result<Self> {
+        let token = env::args()
+            .nth(1)
+            .ok_or(ErrorKind::MissingToken)?;
         let client = Client::configure()
             .connector(HttpsConnector::new(2, &handle)?)
             .build(&handle);
@@ -246,6 +314,9 @@ impl Cache {
             client,
             connect_uri: None,
             bad_attempts: 0,
+            token,
+            users: HashMap::new(),
+            channels: HashMap::new(),
         };
         Ok(Cache(Rc::new(RefCell::new(inner))))
     }
@@ -258,14 +329,11 @@ impl Cache {
                 return Ok(uri.clone());
             }
             info!("Requesting address");
-            let token = env::args()
-                .nth(1)
-                .ok_or(ErrorKind::MissingToken)?;
             let auth = SimpleAuth {
-                token
+                token: me.token.clone()
             };
             request(&me.client, CONNECT_URI.parse()?, &auth)
-        };
+        }; // Unlock self before going async
         let ws_uri: WsAddr = await!(ws_uri)?;
         let result = ws_uri.url.clone();
         self.0.borrow_mut().connect_uri = Some(ws_uri.url);
@@ -273,16 +341,16 @@ impl Cache {
     }
 
     fn update_connect_url(&self, url: String) {
-        let mut borrow = self.0.borrow_mut();
-        borrow.connect_uri = Some(url);
-        borrow.bad_attempts = 0;
+        let mut me = self.0.borrow_mut();
+        me.connect_uri = Some(url);
+        me.bad_attempts = 0;
     }
 
     fn bad_url(&self) -> Result<()> {
-        let mut borrow = self.0.borrow_mut();
-        borrow.connect_uri = None;
-        borrow.bad_attempts += 1;
-        if borrow.bad_attempts > MAX_ATTEPMS {
+        let mut me = self.0.borrow_mut();
+        me.connect_uri = None;
+        me.bad_attempts += 1;
+        if me.bad_attempts > MAX_ATTEPMS {
             Err(ErrorKind::BadAttempts.into())
         } else {
             Ok(())
@@ -290,7 +358,60 @@ impl Cache {
     }
 
     fn invalidate(&self) {
-        // Nothing to invalidate yet. But some info may become stale on reconnect, so wipe it then.
+        let mut me = self.0.borrow_mut();
+        me.users.clear();
+    }
+
+    #[async]
+    fn user(self, id: String) -> Result<User> {
+        let req = {
+            let me = self.0.borrow();
+            if let Some(user) = me.users.get(&id) {
+                return Ok(user.clone());
+            }
+            let token = me.token.clone();
+            #[derive(Debug, Serialize)]
+            struct Req {
+                user: String,
+                token: String,
+            }
+            let req = Req {
+                user: id.clone(),
+                token,
+            };
+            request(&me.client, USER_INFO_REQ.parse()?, &req)
+        };
+        #[derive(Debug, Deserialize)]
+        struct Wrapper { user: User }
+        let Wrapper { user }  = await!(req)?;
+        self.0.borrow_mut().users.insert(id, user.clone());
+        Ok(user)
+    }
+
+    #[async]
+    fn channel(self, id: String) -> Result<Channel> {
+        let req = {
+            let me = self.0.borrow();
+            if let Some(channel) = me.channels.get(&id) {
+                return Ok(channel.clone());
+            }
+            let token = me.token.clone();
+            #[derive(Debug, Serialize)]
+            struct Req {
+                channel: String,
+                token: String,
+            }
+            let req = Req {
+                channel: id.clone(),
+                token,
+            };
+            request(&me.client, CHANNEL_INFO_REQ.parse()?, &req)
+        };
+        #[derive(Debug, Deserialize)]
+        struct Wrapper { channel: Channel }
+        let Wrapper { channel }  = await!(req)?;
+        self.0.borrow_mut().channels.insert(id, channel.clone());
+        Ok(channel)
     }
 }
 
@@ -317,17 +438,25 @@ fn connection(handle: Handle, cache: Cache) -> Result<()> {
             OwnedMessage::Ping(data) => {
                 sink = await!(sink.send(OwnedMessage::Pong(data)))?;
             },
-            OwnedMessage::Text(text) => match serde_json::from_str::<Notification>(&text) {
-                Ok(Notification::ReconnectUrl { url }) => {
-                    debug!("Updating connect url to {}", url);
-                    cache.update_connect_url(url);
-                },
-                Ok(Notification::Error { msg,.. }) => {
-                    error!("Error from slack: {}", msg);
-                    return cache.bad_url();
-                },
-                Ok(notif) => info!("Notification {:?}", notif),
-                Err(_) => warn!("Unknown msg '{}'", text),
+            OwnedMessage::Text(text) => {
+                let notif = serde_json::from_str::<Notification>(&text);
+                match notif {
+                    Ok(Notification::ReconnectUrl { url }) => {
+                        debug!("Updating connect url to {}", url);
+                        cache.update_connect_url(url);
+                    },
+                    Ok(Notification::Error { msg,.. }) => {
+                        error!("Error from slack: {}", msg);
+                        return cache.bad_url();
+                    },
+                    Ok(notif) => {
+                        info!("Notification {:?}", notif);
+                        if let Some(event) = await!(notif.into_event(cache.clone()))? {
+                            println!("{}", event);
+                        }
+                    },
+                    Err(_) => warn!("Unknown msg '{}'", text),
+                }
             },
             _ => warn!("Unknown msg {:?}", msg),
         }
