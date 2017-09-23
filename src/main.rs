@@ -9,13 +9,14 @@ extern crate hyper_tls;
 #[macro_use]
 extern crate log;
 extern crate native_tls;
-extern crate tokio_core;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
 extern crate serde_urlencoded;
 extern crate simplelog;
+extern crate term;
+extern crate tokio_core;
 extern crate websocket;
 
 use std::cell::RefCell;
@@ -42,6 +43,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Error as JsonError, Value};
 use serde_urlencoded::ser::Error as UrlSerError;
 use simplelog::{Config as LogConfig, LogLevelFilter, WriteLogger};
+use term::{Error as TermError, StdoutTerminal, color};
 use tokio_core::reactor::{Core, Handle};
 use websocket::client::{ClientBuilder, ParseError};
 use websocket::{OwnedMessage, WebSocketError};
@@ -57,12 +59,17 @@ error_chain! {
         WSUriError(ParseError);
         WSError(WebSocketError);
         UrlSerError(UrlSerError);
+        Term(TermError);
     }
 
     errors {
         MissingToken {
             description("Missing the token parameter")
             display("Missing the token parameter")
+        }
+        MissingTerm {
+            description("Missing the terminal")
+            display("Missing the terminal")
         }
         HttpError(status: StatusCode) {
             description("Unexpected HTTP response")
@@ -418,7 +425,9 @@ impl Cache {
 }
 
 #[async]
-fn connection(handle: Handle, cache: Cache) -> Result<()> {
+fn connection(handle: Handle, cache: Cache, mut t: Box<StdoutTerminal>)
+    -> Result<Box<StdoutTerminal>>
+{
     cache.invalidate();
     let uri = await!(cache.clone().connect_uri())?;
     debug!("Connecting to {}", uri);
@@ -428,7 +437,10 @@ fn connection(handle: Handle, cache: Cache) -> Result<()> {
         Ok((connection, _headers)) => connection,
         Err(e) => {
             error!("Connection error: {}", e);
-            return cache.bad_url();
+            return match cache.bad_url() {
+                Ok(()) => Ok(t),
+                Err(e) => Err(e),
+            };
         }
     };
     let (sink, stream) = connection.split();
@@ -449,12 +461,40 @@ fn connection(handle: Handle, cache: Cache) -> Result<()> {
                     },
                     Ok(Notification::Error { msg,.. }) => {
                         error!("Error from slack: {}", msg);
-                        return cache.bad_url();
+                        return match cache.bad_url() {
+                            Ok(()) => Ok(t),
+                            Err(e) => Err(e),
+                        };
                     },
                     Ok(notif) => {
                         info!("Notification {:?}", notif);
-                        if let Some(event) = await!(notif.into_event(cache.clone()))? {
-                            println!("{}", event);
+                        match await!(notif.into_event(cache.clone()))? {
+                            Some(Event::PresenceChange { user, presence }) => {
+                                t.fg(color::MAGENTA)?;
+                                writeln!(t,
+                                       "@{} [{}] is now {:?}",
+                                       user.profile.display_name,
+                                       user.profile.real_name,
+                                       presence)?;
+                                t.reset()?;
+                            },
+                            Some(Event::Message { channel, user, text }) => {
+                                t.fg(color::RED)?;
+                                let chname = channel.name
+                                    .as_ref()
+                                    .map(|name| format!("#{}\t", name))
+                                    .unwrap_or_else(String::new);
+                                write!(t, "{}", chname)?;
+                                t.fg(color::BLUE)?;
+                                write!(t,
+                                       "@{} [{}]: ",
+                                       user.profile.display_name,
+                                       user.profile.real_name)?;
+                                t.reset()?;
+                                writeln!(t, "{}", text)?;
+                            },
+                            Some(other) => writeln!(t, "{:?}", other)?,
+                            None => (),
                         }
                     },
                     Err(_) => warn!("Unknown msg '{}'", text),
@@ -463,14 +503,15 @@ fn connection(handle: Handle, cache: Cache) -> Result<()> {
             _ => warn!("Unknown msg {:?}", msg),
         }
     }
-    Ok(())
+    Ok(t)
 }
 
 #[async]
 fn keep_running(handle: Handle) -> Result<!> {
+    let mut t = term::stdout().ok_or(ErrorKind::MissingTerm)?;
     let cache = Cache::new(handle.clone())?;
     loop {
-        await!(connection(handle.clone(), cache.clone()))?;
+        t = await!(connection(handle.clone(), cache.clone(), t))?;
     }
 }
 
