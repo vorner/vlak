@@ -1,7 +1,6 @@
 #![feature(clippy, never_type, conservative_impl_trait, generators, plugin, proc_macro)]
 #![recursion_limit = "256"]
 
-extern crate env_logger;
 #[macro_use]
 extern crate error_chain;
 extern crate futures_await as futures;
@@ -16,12 +15,14 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate serde_urlencoded;
+extern crate simplelog;
 extern crate websocket;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::fs::File;
 use std::io::Error as IoError;
 use std::process;
 use std::rc::Rc;
@@ -40,6 +41,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Error as JsonError, Value};
 use serde_urlencoded::ser::Error as UrlSerError;
+use simplelog::{Config as LogConfig, LogLevelFilter, WriteLogger};
 use tokio_core::reactor::{Core, Handle};
 use websocket::client::{ClientBuilder, ParseError};
 use websocket::{OwnedMessage, WebSocketError};
@@ -473,7 +475,8 @@ fn keep_running(handle: Handle) -> Result<!> {
 }
 
 fn core_loop() -> Result<!> {
-    env_logger::init()?;
+    let f = File::create("log.txt")?;
+    WriteLogger::init(LogLevelFilter::Debug, LogConfig::default(), f)?;
     let mut core = Core::new()?;
     let handle = core.handle();
     core.run(keep_running(handle))
