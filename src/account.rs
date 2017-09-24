@@ -5,6 +5,8 @@ use std::rc::Rc;
 
 use futures::future::Either;
 use futures::prelude::*;
+use futures::stream::Stream;
+use futures::unsync::mpsc::{self, UnboundedSender};
 use hyper::{Client, Method, Request, StatusCode, Uri};
 use hyper::client::{Connect, HttpConnector};
 use hyper::header::{ContentLength, ContentType};
@@ -14,7 +16,6 @@ use serde::de::DeserializeOwned;
 use serde_json::{self, Value};
 use serde_urlencoded;
 use tokio_core::reactor::Handle;
-use term::{self, StdoutTerminal, color};
 use websocket::client::ClientBuilder;
 use websocket::OwnedMessage;
 
@@ -98,38 +99,38 @@ where
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Presence {
+pub enum Presence {
     Active,
     Away,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct Profile {
+pub struct Profile {
     #[serde(default)]
     status_text: String,
     real_name_normalized: String,
-    real_name: String,
+    pub real_name: String,
     display_name_normalized: String,
-    display_name: String,
+    pub display_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct User {
+pub struct User {
     id: String,
     team_id: String,
-    profile: Profile,
-    name: String,
+    pub profile: Profile,
+    pub name: String,
     real_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct Channel {
+pub struct Channel {
     id: String,
-    name: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug)]
-enum Event {
+pub enum Event {
     PresenceChange {
         user: User,
         presence: Presence,
@@ -222,6 +223,7 @@ struct AccountInternal {
     bad_attempts: usize,
     user: HashMap<String, User>,
     channel: HashMap<String, Channel>,
+    event_streams: Vec<UnboundedSender<Rc<Event>>>,
 }
 
 #[derive(Clone)]
@@ -270,6 +272,7 @@ impl Account {
             bad_attempts: 0,
             user: HashMap::new(),
             channel: HashMap::new(),
+            event_streams: Vec::new(),
         };
         Ok(Account(Rc::new(RefCell::new(result))))
     }
@@ -325,7 +328,7 @@ impl Account {
     }
 
     #[async]
-    fn connection(self, mut t: Box<StdoutTerminal>) -> Result<Box<StdoutTerminal>> {
+    fn connection(self) -> Result<()> {
         self.invalidate();
         let uri = await!(self.clone().connect_uri())?;
         debug!("Connecting to {}", uri);
@@ -335,10 +338,7 @@ impl Account {
             Ok((connection, _headers)) => connection,
                 Err(e) => {
                     error!("Connection error: {}", e);
-                    return match self.bad_url() {
-                        Ok(()) => Ok(t),
-                            Err(e) => Err(e),
-                    };
+                    return self.bad_url();
                 }
         };
         let (sink, stream) = connection.split();
@@ -350,66 +350,51 @@ impl Account {
                 OwnedMessage::Ping(data) => {
                     sink = await!(sink.send(OwnedMessage::Pong(data)))?;
                 },
-                    OwnedMessage::Text(text) => {
-                        let notif = serde_json::from_str::<Notification>(&text);
-                        match notif {
-                            Ok(Notification::ReconnectUrl { url }) => {
-                                debug!("Updating connect url to {}", url);
-                                self.update_connect_url(url);
-                            },
-                            Ok(Notification::Error { msg,.. }) => {
-                                error!("Error from slack: {}", msg);
-                                return match self.bad_url() {
-                                    Ok(()) => Ok(t),
-                                        Err(e) => Err(e),
-                                };
-                            },
-                            Ok(notif) => {
-                                info!("Notification {:?}", notif);
-                                match await!(notif.into_event(self.clone()))? {
-                                    Some(Event::PresenceChange { user, presence }) => {
-                                        t.fg(color::MAGENTA)?;
-                                        writeln!(t,
-                                                 "@{} [{}] is now {:?}",
-                                                 user.profile.display_name,
-                                                 user.profile.real_name,
-                                                 presence)?;
-                                        t.reset()?;
-                                    },
-                                    Some(Event::Message { channel, user, text }) => {
-                                        t.fg(color::RED)?;
-                                        let chname = channel.name
-                                            .as_ref()
-                                            .map(|name| format!("#{}\t", name))
-                                            .unwrap_or_else(String::new);
-                                        write!(t, "{}", chname)?;
-                                        t.fg(color::BLUE)?;
-                                        write!(t,
-                                               "@{} [{}]: ",
-                                               user.profile.display_name,
-                                               user.profile.real_name)?;
-                                        t.reset()?;
-                                        writeln!(t, "{}", text)?;
-                                    },
-                                    Some(other) => writeln!(t, "{:?}", other)?,
-                                    None => (),
-                                }
-                            },
-                            Err(_) => warn!("Unknown msg '{}'", text),
-                        }
-                    },
-                    _ => warn!("Unknown msg {:?}", msg),
+                OwnedMessage::Text(text) => {
+                    let notif = serde_json::from_str::<Notification>(&text);
+                    match notif {
+                        Ok(Notification::ReconnectUrl { url }) => {
+                            debug!("Updating connect url to {}", url);
+                            self.update_connect_url(url);
+                        },
+                        Ok(Notification::Error { msg,.. }) => {
+                            error!("Error from slack: {}", msg);
+                            return self.bad_url();
+                        },
+                        Ok(notif) => {
+                            info!("Notification {:?}", notif);
+                            if let Some(event) = await!(notif.into_event(self.clone()))? {
+                                self.broadcast(event);
+                            }
+                        },
+                        Err(_) => warn!("Unknown msg '{}'", text),
+                    }
+                },
+                _ => warn!("Unknown msg {:?}", msg),
             }
         }
-        Ok(t)
+        Ok(())
     }
 
     #[async]
     pub fn keep_running(self) -> Result<!> {
-        let mut t = term::stdout().ok_or(ErrorKind::MissingTerm)?;
         loop {
-            t = await!(self.clone().connection(t))?;
+            await!(self.clone().connection())?;
         }
+    }
+
+    pub fn events(&self) -> impl Stream<Item = Rc<Event>, Error = Error> {
+        let (sender, receiver) = mpsc::unbounded();
+        self.0.borrow_mut().event_streams.push(sender);
+        receiver.map_err(|()| panic!("No error possible"))
+    }
+
+    pub fn broadcast(&self, event: Event) {
+        let ev = Rc::new(event);
+        self.0
+            .borrow_mut()
+            .event_streams.
+            retain(|sender| sender.unbounded_send(Rc::clone(&ev)).is_ok());
     }
 
     cached!(user, User, USER_INFO_REQ);
