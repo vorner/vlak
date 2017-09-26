@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use chrono::Local;
 use futures::Stream;
 use futures::prelude::*;
 use term::{self, color};
@@ -40,13 +41,21 @@ impl<S: Stream<Item = Rc<Event>, Error = Error> + 'static> Ui<S> {
                              presence)?;
                     t.reset()?;
                 },
-                Event::Message { ref channel, ref user, ref text } => {
+                Event::Message { ref channel, ref user, ref text, ref time } => {
+                    let today = Local::today();
+                    let ts = if today == time.date() {
+                        time.format("%R")
+                    } else {
+                        time.format("%d.%m")
+                    };
                     t.fg(color::RED)?;
                     let chname = channel.name
                         .as_ref()
                         .map(|name| format!("#{}\t", name))
                         .unwrap_or_else(String::new);
                     write!(t, "{}", chname)?;
+                    t.fg(color::GREEN)?;
+                    write!(t, "{} ", ts)?;
                     t.fg(color::BLUE)?;
                     write!(t, "@{} [{}]: ",
                            user.profile.display_name,
@@ -54,9 +63,6 @@ impl<S: Stream<Item = Rc<Event>, Error = Error> + 'static> Ui<S> {
                     t.reset()?;
                     writeln!(t, "{}", text)?;
                 },
-                ref other => {
-                    writeln!(t, "{:?}", other)?;
-                }
             }
             writeln!(t, "Status: <unsupported>")?;
         }

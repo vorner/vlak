@@ -1,6 +1,7 @@
 #![feature(clippy, never_type, conservative_impl_trait, generators, plugin, proc_macro)]
 #![recursion_limit = "256"]
 
+extern crate chrono;
 #[macro_use]
 extern crate error_chain;
 extern crate futures_await as futures;

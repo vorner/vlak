@@ -1,4 +1,5 @@
 use std::io::Error as IoError;
+use std::num::ParseFloatError;
 
 use hyper::StatusCode;
 use hyper::error::{Error as HyperError, UriError};
@@ -22,6 +23,7 @@ error_chain! {
         WSError(WebSocketError);
         UrlSerError(UrlSerError);
         Term(TermError);
+        ParseFloat(ParseFloatError);
     }
 
     errors {

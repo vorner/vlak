@@ -1,8 +1,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::fmt::Debug;
 use std::rc::Rc;
 
+use chrono::{DateTime, Local, TimeZone};
 use futures::future::Either;
 use futures::prelude::*;
 use futures::stream::Stream;
@@ -135,38 +136,11 @@ pub enum Event {
         user: User,
         presence: Presence,
     },
-    UserChange(User),
     Message {
         user: User,
         channel: Channel,
         text: String,
-    }
-}
-
-impl Display for Event {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        match *self {
-            Event::PresenceChange { ref user, ref presence } => {
-                write!(f,
-                       "@{} [{}] is now {:?}",
-                       user.profile.display_name,
-                       user.profile.real_name,
-                       presence)
-            },
-            Event::Message { ref user, ref channel, ref text } => {
-                let chname = channel.name
-                    .as_ref()
-                    .map(|name| format!("#{}\t", name))
-                    .unwrap_or_else(String::new);
-                write!(f,
-                       "{}@{} [{}]: {}",
-                       chname,
-                       user.profile.display_name,
-                       user.profile.real_name,
-                       text)
-            }
-            _ => (self as &Debug).fmt(f)
-        }
+        time: DateTime<Local>,
     }
 }
 
@@ -202,12 +176,21 @@ impl Notification {
                 let user = await!(account.user(user))?;
                 Some(Event::PresenceChange { presence, user })
             },
-            Notification::Message { channel, user, text, .. } => {
+            Notification::Message { channel, user, text, ts } => {
                 // TODO: The time stamp?
                 let user = account.clone().user(user);
                 let channel = account.channel(channel);
                 let (user, channel) = await!(user.join(channel))?;
-                Some(Event::Message{ user, channel, text })
+                let ts = ts.parse::<f64>()?;
+                let seconds = ts.trunc() as i64;
+                let nanos = (ts.fract() * 1_000_000_000.0).round() as u32;
+                let time = Local.timestamp(seconds, nanos);
+                Some(Event::Message{
+                     user,
+                     channel,
+                     text,
+                     time,
+                })
             }
             _ => None,
         };
